@@ -26,6 +26,22 @@ def _verified_focus(monkeypatch, *, secure: bool) -> None:
     monkeypatch.setattr(il, "_element_secure_status", lambda _element: secure)
 
 
+@pytest.mark.parametrize(
+    ("subrole_err", "expected"),
+    [(-25212, False), (-25205, False), (-25204, None), (0, False)],
+)
+def test_text_area_without_subrole_is_not_secure(monkeypatch, subrole_err, expected):
+    monkeypatch.setattr(il, "_diag_rate_limited", lambda _msg: None)
+
+    def copy_attribute(_element, attribute, _unused):
+        if attribute == "AXRole":
+            return 0, "AXTextArea"
+        return subrole_err, None
+
+    monkeypatch.setattr(il, "AXUIElementCopyAttributeValue", copy_attribute)
+    assert il._element_secure_status(object()) is expected
+
+
 def test_recheck_clears_field_pause_on_verified_non_secure_focus(monkeypatch):
     _verified_focus(monkeypatch, secure=False)
     il._set_pause(field=True)

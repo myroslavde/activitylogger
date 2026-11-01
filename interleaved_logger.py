@@ -283,6 +283,8 @@ WORKLOAD_IDLE_SEC = 300.0
 MAX_ANALYSIS_MARKERS = 2000
 ANALYSIS_HEARTBEAT_SEC = 3600.0
 SECURE_FIELD_RECHECK_SEC = 3.0
+AX_ERR_ATTRIBUTE_UNSUPPORTED = -25205
+AX_ERR_NO_VALUE = -25212
 SUSPEND_GAP_SEC = 120.0
 
 _diag_last: dict[str, float] = {}
@@ -468,7 +470,9 @@ def _element_secure_status(element) -> bool | None:
         )
         if secure:
             return True
-        if subrole_err != 0 and role_str in {"AXTextField", "AXTextArea"}:
+        # NoValue / AttributeUnsupported mean the field has no subrole, so it is not secure.
+        no_subrole = subrole_err in (AX_ERR_NO_VALUE, AX_ERR_ATTRIBUTE_UNSUPPORTED)
+        if subrole_err != 0 and not no_subrole and role_str in {"AXTextField", "AXTextArea"}:
             _diag_rate_limited(
                 f"secure field focus unverified [AXSubrole err={subrole_err} role={role_str}]"
             )
