@@ -86,6 +86,7 @@ from config import (
     load_config,
     startup_diag_line,
 )
+from credential_redaction import redact as redact_credentials
 from markdown_format import (
     CAPTURE_TRIGGERS,
     format_markdown_fenced_text,
@@ -107,7 +108,7 @@ from window_titles import (
     merge_native_and_aw,
 )
 
-__version__ = "4.6.1"
+__version__ = "4.7.0"
 ANALYSIS_SHADOW_ENABLED = True
 
 # Config mirrors - seeded from AppConfig defaults (single literal source: config.default_config).
@@ -840,7 +841,7 @@ def _seal_open_events_locked(trigger: str) -> None:
         raise ValueError("typing_pause is reserved; do not emit as section trigger")
     captured_at = datetime.now().astimezone()
     section: dict = {
-        "heading": _current_heading or FALLBACK_HEADING,
+        "heading": redact_credentials(_current_heading or FALLBACK_HEADING),
         "events": list(_current_events),
         "timestamp": captured_at.strftime("%H:%M:%S"),
         "captured_at": captured_at,
@@ -865,7 +866,8 @@ def _flush_keys(*, cause: str = "unknown") -> None:
     global _last_key_flush_cause, _last_key_activity_mono
     if not _current_keystrokes:
         return
-    payload = "".join(_current_keystrokes)
+    # ponytail: secrets split across key flushes are not caught; hold-back would delay every flush.
+    payload = redact_credentials("".join(_current_keystrokes))
     _current_events.append(
         CapturedEvent(
             payload,
@@ -951,7 +953,7 @@ def _append_analysis_marker_locked(
     sequence = next(_analysis_sequence)
     _analysis_markers.append(
         {
-            "heading": heading,
+            "heading": redact_credentials(heading),
             "events": [
                 CapturedEvent(
                     "",
@@ -1086,6 +1088,21 @@ def apply_heading_change(new_heading: str) -> None:
         flush_to_file()
 
 
+def _redacted_event(ev: CapturedEvent) -> CapturedEvent:
+    """Return ``ev`` with credentials redacted in its text and payload (same object if clean)."""
+    legacy, payload = str(ev), ev.payload
+    safe_legacy, safe_payload = redact_credentials(legacy), redact_credentials(payload)
+    if safe_legacy == legacy and safe_payload == payload:
+        return ev
+    return CapturedEvent(
+        safe_legacy,
+        kind=ev.kind,
+        payload=safe_payload,
+        captured_at=ev.captured_at,
+        sequence=ev.sequence,
+    )
+
+
 def _add_event_locked(ev: str, seal_trigger: str | None = None) -> bool:
     if _stop_event.is_set() or _is_paused or _storage_blocked:
         return False
@@ -1103,6 +1120,7 @@ def _add_event_locked(ev: str, seal_trigger: str | None = None) -> bool:
         ev = CapturedEvent(
             str(ev), kind="event", payload=str(ev), sequence=next(_analysis_sequence)
         )
+    ev = _redacted_event(ev)
     _current_events.append(ev)
     if seal_trigger and CAPTURE_TRIGGERS_ENABLED:
         _seal_open_events_locked(seal_trigger)
@@ -1200,7 +1218,7 @@ def _flush_scroll_burst_locked() -> bool:
     if _is_paused:
         _scroll_burst = scroll_discard(_scroll_burst)
         return False
-    line = format_burst_line(_scroll_burst)
+    line = redact_credentials(format_burst_line(_scroll_burst))
     _scroll_burst = None
     _scroll_deadline_changed.set()
     # Inline add_event path while holding lock (avoid re-entrant lock).
@@ -1732,7 +1750,7 @@ def scan_screen(expected_context: tuple[int, str, str] | None = None) -> None:
                 return
             prev = _last_screen_text
         if prev[:SCREEN_COMPARE_MAX_CHARS] != text[:SCREEN_COMPARE_MAX_CHARS]:
-            payload = text[:2000]
+            payload = redact_credentials(text)[:2000]
             event = CapturedEvent(
                 f"💻 **Екран:**\n{format_markdown_fenced_text(payload)}",
                 kind="screen",
@@ -1805,7 +1823,7 @@ def _resolve_pending_click(
         section.pop("privacy_generation", None)
         section.pop("click_context", None)
         section.pop("expires_mono", None)
-        clean_desc = sanitize_markdown_inline(desc, "Unknown")
+        clean_desc = redact_credentials(sanitize_markdown_inline(desc, "Unknown"))
         section["events"].append(
             CapturedEvent(
                 f"🖱️ **Клік:** {clean_desc}",
@@ -1833,7 +1851,7 @@ def _reserve_pending_click(context: tuple[int, str, str]) -> int | None:
         captured_at = datetime.now().astimezone()
         pending_id = next(_click_sequence)
         section = {
-            "heading": _current_heading or FALLBACK_HEADING,
+            "heading": redact_credentials(_current_heading or FALLBACK_HEADING),
             "events": [],
             "timestamp": captured_at.strftime("%H:%M:%S"),
             "captured_at": captured_at,
@@ -2020,7 +2038,7 @@ def apply_clipboard_change(
     if paused:
         return count, new_text, None
     if text and text != last_text:
-        payload = text[:2000]
+        payload = redact_credentials(text)[:2000]
         return count, text, CapturedEvent(
             f"> [CLIPBOARD]:\n{format_markdown_fenced_text(payload)}",
             kind="clipboard",
@@ -2045,13 +2063,44 @@ def _apply_clipboard_change_digest(
     digest = _clipboard_digest(text) if text else last_digest
     if paused or not text or digest == last_digest:
         return count, digest, None
-    payload = text[:2000]
+    payload = redact_credentials(text)[:2000]
     event = CapturedEvent(
         f"> [CLIPBOARD]:\n{format_markdown_fenced_text(payload)}",
         kind="clipboard",
         payload=payload,
     )
     return count, digest, event
+
+
+CONCEALED_CLIPBOARD_TYPES = frozenset(
+    {
+        "org.nspasteboard.ConcealedType",
+        "org.nspasteboard.TransientType",
+        "org.nspasteboard.AutoGeneratedType",
+    }
+)
+CONCEALED_CLIPBOARD_PLACEHOLDER = "[concealed]"
+
+
+def _clipboard_is_concealed(pb) -> bool:
+    return bool({str(kind) for kind in (pb.types() or [])} & CONCEALED_CLIPBOARD_TYPES)
+
+
+def _clipboard_text(pb, count: int) -> str | None:
+    """Read pasteboard text, or return the placeholder if the copier marked it concealed.
+
+    Concealed text is never read. Types are checked before and after the read, and the
+    change count must be unchanged after it; None means the pasteboard changed mid-read
+    (retry next cycle). A types() error propagates, so nothing is read or recorded.
+    """
+    if _clipboard_is_concealed(pb):
+        return CONCEALED_CLIPBOARD_PLACEHOLDER
+    text = pb.stringForType_(NSStringPboardType) or ""
+    if pb.changeCount() != count:
+        return None
+    if _clipboard_is_concealed(pb):
+        return CONCEALED_CLIPBOARD_PLACEHOLDER
+    return text
 
 
 def clipboard_checker_loop() -> None:
@@ -2098,7 +2147,9 @@ def clipboard_checker_loop() -> None:
                     _last_clipboard_privacy_generation != privacy_generation
                 )
             context = _capture_context()
-            text = pb.stringForType_(NSStringPboardType) or ""
+            text = _clipboard_text(pb, count)
+            if text is None:
+                continue
             final_context = _capture_context(context) if context is not None else None
             need_flush = False
             with _lock:

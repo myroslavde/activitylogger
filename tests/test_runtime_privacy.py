@@ -454,7 +454,7 @@ def test_url_capture_spanning_pause_is_absorbed(monkeypatch):
 
 def test_clipboard_read_spanning_pause_is_absorbed(monkeypatch):
     pasteboard = MagicMock()
-    pasteboard.changeCount.side_effect = [1, 2]
+    pasteboard.changeCount.side_effect = [1, 2, 2]
 
     def read_text(_kind):
         il._set_pause(field=True)
@@ -477,7 +477,7 @@ def test_clipboard_read_spanning_pause_is_absorbed(monkeypatch):
 
 def test_clipboard_change_during_pause_between_polls_is_absorbed(monkeypatch):
     pasteboard = MagicMock()
-    pasteboard.changeCount.side_effect = [1, 2]
+    pasteboard.changeCount.side_effect = [1, 2, 2]
     pasteboard.stringForType_.return_value = "copied while paused"
     waits = 0
 

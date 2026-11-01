@@ -2020,3 +2020,276 @@ def mark_invalid(log_dir: Path, day: date, reason: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+REDACTED_MARKER = "[REDACTED]"
+_REDACTION_UNVERIFIED = "Redaction could not be verified. Nothing was written."
+_REDACTION_PENDING = "An analysis transaction is pending. Recover it first, then try again."
+_REDACTION_HEADING = "A literal also appears outside record payloads. Nothing was written."
+_REDACTION_MARKER_TEXT = "A literal is part of the redaction marker. Nothing was written."
+_REDACTION_STOPPED = (
+    "Writing stopped before the day was verified. Backups are in {}. "
+    "Check the day with a --reseal dry run before retrying."
+)
+_RESEAL_REASONS = frozenset({"intent_mismatch", "proof_missing", "proof_invalid"})
+
+
+class RedactionRefused(ValueError):
+    """Payload-free refusal. Messages are fixed sentences; never add literals or record text."""
+
+
+@dataclass(frozen=True)
+class DayRedaction:
+    day: date
+    reason_before: str
+    occurrences: tuple[int, ...]
+    records_changed: int
+    batches_redigested: int
+    canonical: bytes
+    canonical_changed: bool
+    journal: bytes
+    journal_changed: bool
+
+
+def _redact_payload(payload: str, literals: Sequence[str]) -> tuple[str, tuple[int, ...]]:
+    """One pass over the original payload. Overlapping matches merge into one [REDACTED].
+
+    Matches that touch an existing marker are skipped, so reruns are idempotent. Each
+    merged span credits every literal that matched inside it.
+    """
+    marks = [match.span() for match in re.finditer(re.escape(REDACTED_MARKER), payload)]
+    spans: list[tuple[int, int, int]] = []
+    for index, literal in enumerate(literals):
+        start = payload.find(literal)
+        while start >= 0:
+            end = start + len(literal)
+            if not any(start < mark_end and mark_start < end for mark_start, mark_end in marks):
+                spans.append((start, end, index))
+            start = payload.find(literal, start + 1)
+    merged: list[list[object]] = []
+    for start, end, index in sorted(spans):
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2].add(index)
+        else:
+            merged.append([start, end, {index}])
+    out: list[str] = []
+    counts = [0] * len(literals)
+    cursor = 0
+    for start, end, indexes in merged:
+        out.append(payload[cursor:start])
+        out.append(REDACTED_MARKER)
+        cursor = end
+        for index in indexes:
+            counts[index] += 1
+    out.append(payload[cursor:])
+    return "".join(out), tuple(counts)
+
+
+def _redact_payload_spans(text: str, literals: Sequence[str]) -> str:
+    """Rewrite only the JSON payload span of record and timeline lines."""
+    lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        match = _TIMELINE_ROW_RE.fullmatch(line) or _RECORD_RE.fullmatch(line)
+        if match is None or match.group("payload") is None:
+            lines.append(line)
+            continue
+        value = json.loads(match.group("payload"))
+        if not isinstance(value, str):
+            raise RedactionRefused(_REDACTION_UNVERIFIED)
+        redacted = _redact_payload(value, literals)[0]
+        if redacted != value:
+            line = line[: match.start("payload")] + _json_string(redacted) + line[match.end("payload") :]
+        lines.append(line)
+    return "".join(lines)
+
+
+def _verified_redaction(
+    day: date, old_records: Sequence[AnalysisRecord], text: str, literals: Sequence[str]
+) -> tuple[AnalysisRecord, ...]:
+    """Strictly reparse; only payload text may differ from the original records."""
+    new_records = parse_records(text, day=day, strict=True, expected_format=ANALYSIS_FORMAT_V2)
+    if len(new_records) != len(old_records):
+        raise RedactionRefused(_REDACTION_UNVERIFIED)
+    for old, new in zip(old_records, new_records):
+        shape = (old.heading, old.kind, old.captured_at, old.trigger, old.section_captured_at, old.section_start)
+        expected = _redact_payload(old.payload, literals)[0]
+        if (
+            shape != (new.heading, new.kind, new.captured_at, new.trigger, new.section_captured_at, new.section_start)
+            or new.payload != expected
+        ):
+            raise RedactionRefused(_REDACTION_UNVERIFIED)
+    return new_records
+
+
+def _resealed_journal(journal: bytes, records: Sequence[AnalysisRecord]) -> tuple[bytes, int]:
+    """Keep each batch id and count; recompute only its records digest."""
+    header_end = journal.find(HEADER_END.encode("utf-8")) + len(HEADER_END.encode("utf-8"))
+    out, offset, changed = [journal[:header_end]], 0, 0
+    for batch_id, count, digest in _parse_intents(journal):
+        batch = records[offset : offset + count]
+        if len(batch) != count:
+            raise RedactionRefused(_REDACTION_UNVERIFIED)
+        new_digest = _records_digest(batch)
+        changed += new_digest != digest
+        body = _safe_json(
+            {"batch_id": batch_id, "count": count, "records_sha256": new_digest}, compact=True
+        ) + "\n"
+        out.append(_framed_batch_bytes(body, batch_id, count))
+        offset += count
+    if offset != len(records):
+        raise RedactionRefused(_REDACTION_UNVERIFIED)
+    return b"".join(out), changed
+
+
+def _transaction_pending(log_dir: Path) -> bool:
+    return _exists_no_follow(_pending_transaction_path(log_dir)) or bool(_pending_temp_paths(log_dir))
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Atomically replace one owner-only file after fsync."""
+    temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temp, flags, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+        _fsync_directory(path.parent)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _make_private_dirs(path: Path) -> None:
+    """Create missing directories as owner-only; existing ones are only checked."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        os.chmod(directory, 0o700)
+    _ensure_private_dir(path)
+
+
+def plan_day_redaction(
+    log_dir: Path,
+    day: date,
+    literals: Sequence[str],
+    *,
+    reseal: bool = False,
+    today: date | None = None,
+) -> DayRedaction:
+    """Check every guard, then build the exact bytes to write. Writes nothing."""
+    cutoff = today or datetime.now().astimezone().date()
+    if day >= cutoff:
+        raise RedactionRefused("Only completed days can be redacted. Choose an earlier day.")
+    if day < ANALYSIS_ONLY_START_DAY:
+        raise RedactionRefused("Only v2 analysis days can be redacted.")
+    if any(not literal for literal in literals):
+        raise RedactionRefused("Literals must not be empty.")
+    if any(literal in REDACTED_MARKER for literal in literals):
+        raise RedactionRefused(_REDACTION_MARKER_TEXT)
+    if reseal and literals:
+        raise RedactionRefused("--reseal repairs the journal or proof only and takes no literals.")
+    if not reseal and not literals:
+        raise RedactionRefused("Give at least one literal, or use --reseal to repair the journal or proof.")
+    if _transaction_pending(log_dir):
+        raise RedactionRefused(_REDACTION_PENDING)
+    inspection = inspect_analysis_day(log_dir, day, today=cutoff)
+    if inspection.invalid_marker:
+        raise RedactionRefused("The day has an invalid marker. Redaction is refused.")
+    if reseal and inspection.reason not in _RESEAL_REASONS:
+        raise RedactionRefused("Only an intent_mismatch, proof_missing or proof_invalid day can be resealed.")
+    if not reseal and inspection.reason != "ready":
+        raise RedactionRefused("The day must be ready before literals can be redacted. Check its state first.")
+    canonical_path, _invalid_path = analysis_paths(log_dir, day)
+    canonical_bytes = read_private_bytes(canonical_path)
+    journal = read_private_bytes(intent_path(log_dir, day))
+    old_records = parse_records(
+        canonical_bytes.decode("utf-8"), day=day, strict=True, expected_format=ANALYSIS_FORMAT_V2
+    )
+    if any(literal in record.heading for record in old_records for literal in literals):
+        raise RedactionRefused(_REDACTION_HEADING)
+    counts = [0] * len(literals)
+    for record in old_records:
+        for index, count in enumerate(_redact_payload(record.payload, literals)[1]):
+            counts[index] += count
+    new_text = _redact_payload_spans(canonical_bytes.decode("utf-8"), literals)
+    new_records = _verified_redaction(day, old_records, new_text, literals)
+    new_journal, batches = _resealed_journal(journal, new_records)
+    canonical = new_text.encode("utf-8")
+    return DayRedaction(
+        day=day,
+        reason_before=inspection.reason,
+        occurrences=tuple(counts),
+        records_changed=sum(old.payload != new.payload for old, new in zip(old_records, new_records)),
+        batches_redigested=batches,
+        canonical=canonical,
+        canonical_changed=canonical != canonical_bytes,
+        journal=new_journal,
+        journal_changed=new_journal != journal,
+    )
+
+
+def redact_completed_day(
+    log_dir: Path,
+    day: date,
+    literals: Sequence[str] = (),
+    *,
+    backup_root: Path,
+    reseal: bool = False,
+    apply: bool = False,
+    today: date | None = None,
+) -> dict[str, object]:
+    """Dry run by default. Reports hold counts and paths only, never literals or record text."""
+    cutoff = today or datetime.now().astimezone().date()
+    plan = plan_day_redaction(log_dir, day, literals, reseal=reseal, today=cutoff)
+    report: dict[str, object] = {
+        "day": day.isoformat(),
+        "reason_before": plan.reason_before,
+        "literals": len(literals),
+        **{f"literal_{index}_occurrences": count for index, count in enumerate(plan.occurrences, 1)},
+        "records_changed": plan.records_changed,
+        "batches_redigested": plan.batches_redigested,
+        "applied": False,
+    }
+    if not apply:
+        return report
+    if sum(plan.occurrences) == 0 and not reseal:
+        raise RedactionRefused("No literal occurrences were found in record payloads. Nothing was written.")
+    if _transaction_pending(log_dir):
+        raise RedactionRefused(_REDACTION_PENDING)
+    stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f")
+    backups = backup_root / "redaction_backups"
+    _make_private_dirs(backups)
+    backup_dir = backups / f"{day.isoformat()}_{stamp}"
+    try:
+        backup_dir.mkdir(mode=0o700, exist_ok=False)
+    except FileExistsError:
+        raise RedactionRefused("A backup folder for this run already exists. Nothing was written.") from None
+    os.chmod(backup_dir, 0o700)
+    canonical_path, _invalid_path = analysis_paths(log_dir, day)
+    journal_path = intent_path(log_dir, day)
+    proof_path = ready_path(log_dir, day)
+    try:
+        for source in (canonical_path, journal_path, proof_path):
+            if _exists_no_follow(source):
+                _write_private(backup_dir / source.name, read_private_bytes(source))
+        if plan.canonical_changed:
+            _write_private(canonical_path, plan.canonical)
+        if plan.journal_changed:
+            _write_private(journal_path, plan.journal)
+        publish_day_ready(log_dir, day)
+        reason_after = inspect_analysis_day(log_dir, day, today=cutoff).reason
+    except Exception:
+        raise RedactionRefused(_REDACTION_STOPPED.format(backup_dir)) from None
+    report.update(applied=True, reason_after=reason_after, backup_dir=str(backup_dir))
+    if reason_after != "ready":
+        raise RedactionRefused(_REDACTION_STOPPED.format(backup_dir))
+    return report

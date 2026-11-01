@@ -4,7 +4,7 @@ ActivityLogger is a private work journal for one person using a Mac. It records 
 
 It can prepare a focused review of 5 or 7 completed calendar days. ActivityLogger creates the review files, but it does not analyze them, upload them, or act on their contents. You choose a tool you trust and decide what to do with the result.
 
-**Version:** 4.6.1 | **Runtime:** `dist/ActivityLoggerNative.app` | **Operations:** [`docs/MACOS_TCC.md`](docs/MACOS_TCC.md)
+**Version:** 4.7.0 | **Runtime:** `dist/ActivityLoggerNative.app` | **Operations:** [`docs/MACOS_TCC.md`](docs/MACOS_TCC.md)
 
 > ActivityLogger records sensitive plaintext, including typed text and clipboard changes. Use it only on a Mac and user account that you control.
 
@@ -15,7 +15,7 @@ It can prepare a focused review of 5 or 7 completed calendar days. ActivityLogge
 - Find repeated work, friction, and possible errors during a weekly review.
 - Ask for up to five small improvement ideas and rank the top three by likely value and effort.
 - Save whether you found an idea, tried a change, or took no action, with an optional value note.
-- Keep the source data local unless you choose to share a reviewed and redacted copy.
+- Keep the source data local. ActivityLogger uploads nothing, but on this Mac a separate tool uploads ready daily logs to NotebookLM (see [Uploads by context-aggregator](#uploads-by-context-aggregator)).
 
 ActivityLogger is not an exact time tracker or a billing timesheet. A work span shows observed activity, not proven effort time. Gaps can mean idle time, a privacy pause, stopped capture, or missing capture.
 
@@ -97,6 +97,10 @@ If a write cannot be prepared safely, capture stops accepting new activity, keep
 Private directories use mode `700`, and private files use mode `600`. These files are still sensitive plaintext. ActivityLogger does not redact them and does not delete them automatically. They stay until you archive or delete them. Keep FileVault enabled, avoid shared backups, and review every file before external use.
 
 Browser URL capture is off by default. ActivityWatch enrichment is on by default and connects only to this Mac unless the operator turns on remote access. Remote ActivityWatch access and full URL capture require clear choices and produce privacy warnings.
+
+## Uploads by context-aggregator
+
+ActivityLogger itself uploads nothing. A separate local tool, context-aggregator, uploads the daily logs, including typed text and clipboard changes. Its LaunchAgent, `com.context-aggregator.activity-logs`, runs every 15 minutes and uploads each ready daily log to the Google NotebookLM notebook named Myro Logs. Before upload, that tool applies its own size limits and credential redaction. It blocks any day where credentials remain. The tool lives in `~/scripts/contextAggregator`, and ActivityLogger does not depend on it. Unload that LaunchAgent to stop the uploads.
 
 ## Existing installation and maintainer setup
 

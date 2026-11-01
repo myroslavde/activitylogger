@@ -151,8 +151,8 @@ def test_each_capture_channel_checks_excluded_app(native, monkeypatch, channel):
         il.maybe_capture_browser_url("Safari", url_provider=provider)
         provider.assert_not_called()
     else:
-        counts = iter([1, 2])
-        pasteboard = SimpleNamespace(changeCount=lambda: next(counts), stringForType_=lambda _: "synthetic copy")
+        counts = iter([1, 2, 2])
+        pasteboard = SimpleNamespace(changeCount=lambda: next(counts), types=lambda: [], stringForType_=lambda _: "synthetic copy")
         waits = iter([False, True])
         monkeypatch.setattr(il, "NSPasteboard", SimpleNamespace(generalPasteboard=lambda: pasteboard))
         monkeypatch.setattr(il._stop_event, "wait", lambda _: next(waits))
@@ -176,11 +176,11 @@ def test_async_url_and_clipboard_changes_recheck_native_context(native, monkeypa
     assert il._current_events == []
     assert il._last_emitted_url == "https://example.test/changed"
     current[0] = 1
-    counts = iter([1, 2])
+    counts = iter([1, 2, 2])
     def copied(_kind):
         current[0] = 3
         return "synthetic copy"
-    pasteboard = SimpleNamespace(changeCount=lambda: next(counts), stringForType_=copied)
+    pasteboard = SimpleNamespace(changeCount=lambda: next(counts), types=lambda: [], stringForType_=copied)
     waits = iter([False, True])
     monkeypatch.setattr(il, "NSPasteboard", SimpleNamespace(generalPasteboard=lambda: pasteboard))
     monkeypatch.setattr(il._stop_event, "wait", lambda _: next(waits))
