@@ -400,7 +400,10 @@ def storage_report(
         inspect_analysis_day(log_dir, day, today=current_day, inspections=inspections)
         for day in completed if day >= ANALYSIS_ONLY_START_DAY
     ]
-    problem_days = [{"day": item.day, "state": item.state} for item in checked_days if not item.ready]
+    problem_days = [
+        {"day": item.day, "state": item.state, "reason": item.reason}
+        for item in checked_days if not item.ready
+    ]
     total_bytes, unsafe_files = _private_tree_size(log_dir)
     review_bytes, unsafe_review = _private_tree_size(output_dir)
     # The common case has sibling roots. A custom nested root is counted once.

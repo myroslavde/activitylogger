@@ -40,7 +40,7 @@ def test_source_bundle_and_readme_versions_match():
         short_version.group(1),
         bundle_version.group(1),
         readme_version.group(1),
-    } == {"4.6.0"}
+    } == {"4.6.1"}
 
 
 def test_codesign_is_strict_and_pinned():

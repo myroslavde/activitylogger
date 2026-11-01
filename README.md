@@ -4,7 +4,7 @@ ActivityLogger is a private work journal for one person using a Mac. It records 
 
 It can prepare a focused review of 5 or 7 completed calendar days. ActivityLogger creates the review files, but it does not analyze them, upload them, or act on their contents. You choose a tool you trust and decide what to do with the result.
 
-**Version:** 4.6.0 | **Runtime:** `dist/ActivityLoggerNative.app` | **Operations:** [`docs/MACOS_TCC.md`](docs/MACOS_TCC.md)
+**Version:** 4.6.1 | **Runtime:** `dist/ActivityLoggerNative.app` | **Operations:** [`docs/MACOS_TCC.md`](docs/MACOS_TCC.md)
 
 > ActivityLogger records sensitive plaintext, including typed text and clipboard changes. Use it only on a Mac and user account that you control.
 

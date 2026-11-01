@@ -119,7 +119,7 @@ def test_weekly_pack_is_atomic_private_complete_and_source_safe(tmp_path):
         "max_gap_seconds": 39600,
     }
     assert (
-        "39600 seconds exceeds 7200 seconds"
+        "39600 seconds exceeds 9000 seconds"
         in index["days"][1]["quality"]["warnings"][1]
     )
     assert "not prove full capture coverage" in index["coverage_warning"]

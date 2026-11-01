@@ -57,6 +57,7 @@ def clear_logger_runtime() -> None:
         il._secure_field_cache_known = False
         il._secure_field_cache_at = 0.0
         il._secure_field_generation = 0
+        il._secure_field_recheck_mono = None
         il._privacy_generation = 0
         il._manual_control_revision = 0
         il._manual_control_pending = None
@@ -76,6 +77,7 @@ def clear_logger_runtime() -> None:
         il._analysis_runtime_enabled = False
         il._analysis_idle_active = False
         il._analysis_last_heartbeat_mono = None
+        il._wall_clock_last = None
         il._analysis_sequence = itertools.count(1)
         il._window_apply_generation = 0
         il._flush_failed = False

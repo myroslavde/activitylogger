@@ -40,7 +40,7 @@ EVENT_KINDS = frozenset(
     }
 )
 WORKLOAD_KINDS = frozenset({"type", "click", "clipboard", "screen", "url", "scroll", "event"})
-LARGE_HEARTBEAT_GAP_SECONDS = 2 * 60 * 60
+LARGE_HEARTBEAT_GAP_SECONDS = 2 * 60 * 60 + 30 * 60  # hourly beats, allow one late beat
 ANALYSIS_TRIGGERS = CAPTURE_TRIGGERS | {"historical", "timeline"}
 ANALYSIS_FORMAT_V1 = "activitylogger-analysis-v1"
 ANALYSIS_FORMAT_V2 = "activitylogger-analysis-v2"
@@ -1638,6 +1638,7 @@ class AnalysisDayInspection:
 
     day: str
     state: str = "unready"
+    reason: str = "unreadable"
     exists: bool = False
     strict_parse: bool = False
     intent_match: bool = False
@@ -1692,7 +1693,16 @@ def completed_analysis_days(log_dir: Path, *, before: date) -> tuple[date, ...]:
     )
 
 
-def heartbeat_summary(records: Sequence[AnalysisRecord]) -> dict[str, int | str | None]:
+def _day_edge(day: date, edge: datetime) -> datetime:
+    """Midnight of day in the process zone if edge was written there, else in edge's own offset."""
+    if edge.astimezone().utcoffset() == edge.utcoffset():
+        return datetime(day.year, day.month, day.day).astimezone()
+    return datetime(day.year, day.month, day.day, tzinfo=edge.tzinfo)
+
+
+def heartbeat_summary(
+    records: Sequence[AnalysisRecord], *, now: datetime | None = None
+) -> dict[str, int | str | None]:
     heartbeats = sorted(record.captured_at for record in records if record.kind == "heartbeat")
     gaps = [
         int((current - previous).total_seconds())
@@ -1701,12 +1711,12 @@ def heartbeat_summary(records: Sequence[AnalysisRecord]) -> dict[str, int | str 
     ]
     if heartbeats:
         day = records[0].section_captured_at.date()
-        day_start = datetime.combine(day, datetime.min.time(), tzinfo=heartbeats[0].tzinfo)
-        day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=heartbeats[-1].tzinfo)
-        gaps.extend((
-            max(0, int((heartbeats[0] - day_start).total_seconds())),
-            max(0, int((day_end - heartbeats[-1]).total_seconds())),
-        ))
+        day_start = _day_edge(day, heartbeats[0])
+        day_end = _day_edge(day + timedelta(days=1), heartbeats[-1])
+        gaps.append(max(0, int((heartbeats[0] - day_start).total_seconds())))
+        # The tail of an unfinished day is not a gap yet.
+        if day_end <= (now or datetime.now().astimezone()):
+            gaps.append(max(0, int((day_end - heartbeats[-1]).total_seconds())))
     return {
         "count": len(heartbeats),
         "first": heartbeats[0].isoformat(timespec="seconds") if heartbeats else None,
@@ -1781,6 +1791,7 @@ def inspect_analysis_day(
     analysis_file, invalid_file = analysis_paths(log_dir, day)
     journal = intent_path(log_dir, day)
     complete_sources = False
+    unready_reason = "unreadable"
     try:
         invalid = _exists_no_follow(invalid_file)
         present = tuple(_exists_no_follow(path) for path in (analysis_file, journal))
@@ -1802,9 +1813,9 @@ def inspect_analysis_day(
             invalid = invalid or _exists_no_follow(invalid_file)
             integrity = matched and stable and not pending and not invalid
             try:
-                _proof_exists, proof = _read_private_file(ready_path(log_dir, day), max_bytes=4096)
+                proof_exists, proof = _read_private_file(ready_path(log_dir, day), max_bytes=4096)
             except OSError:
-                proof = b""
+                proof_exists, proof = True, b""  # present but unreadable counts as invalid, not missing
             stable = stable and before == tuple(_snapshot_identity(path) for path in (analysis_file, journal))
             invalid = invalid or _exists_no_follow(invalid_file)
             pending = pending or (day >= ANALYSIS_ONLY_START_DAY and (
@@ -1812,6 +1823,16 @@ def inspect_analysis_day(
             ))
             integrity = matched and stable and not pending and not invalid
             ready = bool(integrity and day >= ANALYSIS_ONLY_START_DAY and _ready_document_matches(log_dir, day, canonical, intent, proof))
+            if not matched:
+                unready_reason = "intent_mismatch"
+            elif not stable:
+                unready_reason = "unstable_snapshot"
+            elif pending:
+                unready_reason = "pending_transaction"
+            elif not proof_exists:
+                unready_reason = "proof_missing"
+            else:
+                unready_reason = "proof_invalid"
             counts = Counter(record.kind for record in records)
             result = replace(
                 result, strict_parse=True, intent_match=matched, stable_snapshot=stable,
@@ -1826,16 +1847,18 @@ def inspect_analysis_day(
     except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError):
         pass
     if day >= cutoff:
-        state = "active"
+        state, reason = "active", "active"
     elif day < ANALYSIS_ONLY_START_DAY:
-        state = "unsupported"
+        state, reason = "unsupported", "unsupported"
     elif result.invalid_marker:
-        state = "invalid"
+        state, reason = "invalid", "invalid_marker"
     elif not complete_sources:
-        state = "missing"
+        state, reason = "missing", "missing_sources"
+    elif result.ready:
+        state, reason = "ready", "ready"
     else:
-        state = "ready" if result.ready else "unready"
-    result = replace(result, state=state)
+        state, reason = "unready", unready_reason
+    result = replace(result, state=state, reason=reason)
     if inspections is not None:
         inspections[day] = result
     return result

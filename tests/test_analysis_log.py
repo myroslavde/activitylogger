@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 
@@ -500,3 +501,50 @@ def test_timeline_marker_order_does_not_split_legacy_section(
         ("heartbeat", ""),
         ("type", "second"),
     ]
+
+
+@pytest.fixture
+def local_zone(monkeypatch):
+    def use(name: str) -> None:
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+
+    yield use
+    monkeypatch.undo()
+    time.tzset()
+
+
+def _heartbeat(stamp: datetime) -> al.AnalysisRecord:
+    return al.AnalysisRecord("App - Window", "heartbeat", "", stamp, "timeline", stamp, True)
+
+
+def test_heartbeat_gap_ignores_unfinished_day_tail_and_counts_completed_tail(local_zone):
+    local_zone("Europe/Berlin")
+    beats = tuple(_heartbeat(datetime(2026, 8, 28, hour, 30).astimezone()) for hour in range(11))
+    active = al.heartbeat_summary(beats, now=datetime(2026, 8, 28, 12).astimezone())
+    completed = al.heartbeat_summary(beats, now=datetime(2026, 8, 29, 1).astimezone())
+
+    assert active["max_gap_seconds"] == 3600
+    assert completed["max_gap_seconds"] == 13.5 * 3600
+    assert al.LARGE_HEARTBEAT_GAP_SECONDS == 9000
+
+
+def test_heartbeat_day_boundaries_follow_local_dst_midnight(local_zone):
+    local_zone("Europe/Berlin")
+    # 2026-10-25: CEST midnight at the start, CET after the 03:00 switch, so the day is 25 h.
+    cet = timezone(timedelta(hours=1))
+    beats = tuple(_heartbeat(datetime(2026, 10, 25, hour, 30, tzinfo=cet)) for hour in range(3, 19))
+    summary = al.heartbeat_summary(beats, now=datetime(2026, 10, 27, 12).astimezone())
+
+    # Tail 18:30 CET to next CET midnight is 5.5 h; a fixed 24 h day would give 4.5 h.
+    assert summary["max_gap_seconds"] == 5.5 * 3600
+
+
+def test_heartbeat_edges_keep_record_offset_when_process_zone_differs(local_zone):
+    local_zone("America/New_York")
+    plus_two = timezone(timedelta(hours=2))
+    beats = tuple(_heartbeat(datetime(2026, 8, 28, hour, 30, tzinfo=plus_two)) for hour in range(9, 18))
+    summary = al.heartbeat_summary(beats, now=datetime(2026, 8, 30, 12).astimezone())
+
+    # Midnight in +02:00 (not New York): head 9.5 h beats the 6.5 h tail. New York midnight gave 12.5 h.
+    assert summary["max_gap_seconds"] == 9.5 * 3600

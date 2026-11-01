@@ -201,6 +201,7 @@ def test_health_and_storage_reports_are_payload_free(tmp_path):
     assert storage["review_packs"] == 1
     assert storage["missing_readiness_proofs"] == 1
     assert storage["missing_readiness_days"] == second.isoformat()
+    assert storage["problem_days"] == [{"day": second.isoformat(), "state": "unready", "reason": "proof_missing"}]
     assert "App" not in rendered
 
     analysis_file = al.analysis_paths(log_dir, DAY)[0]

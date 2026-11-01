@@ -314,7 +314,7 @@ class ReviewCenterModel:
                 f"{storage.get('review_packs', 0)} review folder(s)."
             )
         problem_lines = [
-            f"{item['day']}: {item['state']}."
+            f"{item['day']}: {item['state']} ({item['reason']})."
             for item in storage.get("problem_days", ())
         ]
         for key, label in (

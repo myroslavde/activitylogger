@@ -107,7 +107,7 @@ from window_titles import (
     merge_native_and_aw,
 )
 
-__version__ = "4.6.0"
+__version__ = "4.6.1"
 ANALYSIS_SHADOW_ENABLED = True
 
 # Config mirrors - seeded from AppConfig defaults (single literal source: config.default_config).
@@ -243,6 +243,7 @@ _secure_field_cache = False
 _secure_field_cache_at = 0.0
 _secure_field_cache_known = False
 _secure_field_generation = 0
+_secure_field_recheck_mono: float | None = None
 _secure_field_lock = threading.RLock()
 _secure_app_lock = threading.RLock()
 
@@ -274,12 +275,15 @@ _analysis_marker_overflow_days: set[date] = set()
 _analysis_runtime_enabled = False
 _analysis_idle_active = False
 _analysis_last_heartbeat_mono: float | None = None
+_wall_clock_last: float | None = None
 _window_apply_generation = 0
 CLICK_RESOLVE_TIMEOUT_SEC = 2.0
 WORKER_JOIN_TIMEOUT_SEC = 6.0
 WORKLOAD_IDLE_SEC = 300.0
 MAX_ANALYSIS_MARKERS = 2000
 ANALYSIS_HEARTBEAT_SEC = 3600.0
+SECURE_FIELD_RECHECK_SEC = 3.0
+SUSPEND_GAP_SEC = 120.0
 
 _diag_last: dict[str, float] = {}
 _DIAG_MIN_INTERVAL = _DEFAULTS.diag_min_interval_sec
@@ -455,6 +459,7 @@ def _element_secure_status(element) -> bool | None:
         subrole_err, subrole = AXUIElementCopyAttributeValue(element, "AXSubrole", None)
         subrole_str = str(subrole) if subrole_err == 0 and subrole is not None else ""
         if not role_known:
+            _diag_rate_limited(f"secure field focus unverified [AXRole err={err}]")
             return None
         secure = (
             "SecureTextField" in role_str
@@ -464,9 +469,13 @@ def _element_secure_status(element) -> bool | None:
         if secure:
             return True
         if subrole_err != 0 and role_str in {"AXTextField", "AXTextArea"}:
+            _diag_rate_limited(
+                f"secure field focus unverified [AXSubrole err={subrole_err} role={role_str}]"
+            )
             return None
         return False
-    except Exception:
+    except Exception as e:
+        _diag_rate_limited(f"secure field focus unverified [{_exception_category(e)}]")
         return None
 
 
@@ -565,11 +574,15 @@ def refresh_secure_field_focus(force: bool = False) -> bool | None:
                 system_wide, "AXFocusedUIElement", None
             )
             if err != 0 or not element:
+                _diag_rate_limited(
+                    f"secure field focus unverified [AXFocusedUIElement err={err}]"
+                )
                 return None
             focused = _element_secure_status(element)
             if focused is None:
                 return None
-        except Exception:
+        except Exception as e:
+            _diag_rate_limited(f"secure field focus unverified [{_exception_category(e)}]")
             return None
         if _stop_event.is_set():
             return None
@@ -597,6 +610,27 @@ def sync_secure_field_from_focus(*, force: bool = False) -> bool | None:
             _set_pause(field=False)
             return False
         return is_paused()
+
+
+def recheck_secure_field_pause(now_mono: float | None = None) -> None:
+    """While the field pause is on, re-verify focus at most every SECURE_FIELD_RECHECK_SEC.
+
+    Takes no lock itself. sync_secure_field_from_focus takes _secure_field_lock, then _lock,
+    the same order as apply_resolved_window and the key path.
+    """
+    global _secure_field_recheck_mono
+    with _lock:
+        paused = _pause_secure_field
+    if not paused or _stop_event.is_set():
+        return
+    current = time.monotonic() if now_mono is None else now_mono
+    if (
+        _secure_field_recheck_mono is not None
+        and current - _secure_field_recheck_mono < SECURE_FIELD_RECHECK_SEC
+    ):
+        return
+    _secure_field_recheck_mono = current
+    sync_secure_field_from_focus(force=True)
 
 
 def _mark_aw_backoff() -> None:
@@ -986,6 +1020,35 @@ def maybe_record_analysis_heartbeat(
     with _lock:
         _append_analysis_marker_locked("heartbeat", captured_at=stamp)
         _analysis_last_heartbeat_mono = current
+    _writer_wakeup.set()
+
+
+def observe_wall_clock_gap(now_wall: float | None = None) -> None:
+    """Lazy sleep detection: a wall-clock jump between checks means the Mac was suspended.
+
+    Monotonic time pauses during sleep, so heartbeats cannot see it. Reuses the idle pair
+    because analysis_log rejects unknown marker kinds. The suspension start goes in the
+    idle_start payload, as observe_system_idle does. Both markers stamp the wake time.
+    """
+    global _wall_clock_last, _analysis_last_heartbeat_mono
+    if not _analysis_runtime_enabled:
+        return
+    current = time.time() if now_wall is None else now_wall
+    previous, _wall_clock_last = _wall_clock_last, current
+    # Only the excess over the normal check interval counts as suspension.
+    # ponytail: a manual clock change looks the same as sleep, accepted for now.
+    if previous is None or current - previous - WINDOW_CHECK_SEC <= SUSPEND_GAP_SEC:
+        return
+    stamp = datetime.fromtimestamp(current).astimezone()
+    suspended_since = datetime.fromtimestamp(previous).astimezone()
+    with _lock:
+        # An open idle span already covers the gap and closes on the next idle observation.
+        if not _analysis_idle_active:
+            _append_analysis_marker_locked(
+                "idle_start", suspended_since.isoformat(), captured_at=stamp
+            )
+            _append_analysis_marker_locked("idle_end", captured_at=stamp)
+        _analysis_last_heartbeat_mono = None
     _writer_wakeup.set()
 
 
@@ -2066,8 +2129,10 @@ def clipboard_checker_loop() -> None:
 
 def window_checker_loop() -> None:
     while not _stop_event.wait(WINDOW_CHECK_SEC):
+        observe_wall_clock_gap()
         app, title = resolve_window()
         process_window_check_cycle(app=app, title=title)
+        recheck_secure_field_pause()
         observe_system_idle()
         maybe_record_analysis_heartbeat()
 

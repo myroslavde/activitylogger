@@ -50,8 +50,8 @@ app = BUNDLE(
     icon='assets/ActivityLogger.icns',
     bundle_identifier='com.mk.activitylogger.native',
     info_plist={
-        'CFBundleShortVersionString': '4.6.0',
-        'CFBundleVersion': '4.6.0',
+        'CFBundleShortVersionString': '4.6.1',
+        'CFBundleVersion': '4.6.1',
         'NSHighResolutionCapable': True,
         'LSBackgroundOnly': False,
         'LSUIElement': True,
